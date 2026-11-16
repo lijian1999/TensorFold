@@ -714,6 +714,33 @@ backend mask hook. A missing library or grammar compilation error is also refuse
 
 The native GLM CUDA backend also supports token grammars, gathering vocabulary rows before rank 0 masks and draws.
 
+### Strict tools under `tool_choice: "auto"`
+
+With tools offered and `tool_choice` omitted or `"auto"`, a tool marked `"strict": true` inside `function` is held
+to its `parameters` schema when the backend has token-grammar support and the grammar library loads. The reply may be
+plain text or calls, and text outside the call markup is free. Inside a call the name is one of the offered tools, a
+strict tool's arguments must follow its schema, and a tool not marked strict takes any JSON object.
+`parallel_tool_calls: false` allows one call; unset or `true` allows several. Auto never requires a call: a text-only
+reply is not an error. Chat passes the tools through; Responses copies the tool's top-level `strict` into `function`.
+Anthropic Messages tools carry no `strict` flag, so they are held only when the switch below is on.
+
+`TENSORFOLD_TOOL_GRAMMAR=1` holds every auto tools request the same way: each offered tool's arguments must follow
+its schema, marked strict or not. Only the value `1` turns it on, with ASCII spaces around it ignored; unset, empty,
+`0` and any other text leave it off, and none of those is refused at startup. Unset is the default. The switch
+applies only to auto: `required` and a named function already constrain the reply to schema-valid calls, so it
+changes nothing there. Where the backend lacks token-grammar support or the grammar library does not load, an auto
+request is served unconstrained rather than refused; the `required` and named cases in that position are refused
+before generation with HTTP 400 and the backend's or library's reason, as described above. A strict auto grammar
+xgrammar cannot compile is also refused before generation with HTTP 400, for example:
+`strict tools under tool_choice "auto" on backend 'qwen27': the grammar cannot be enforced: <xgrammar's reason>`.
+LFM2's template writes its calls as one EBNF rule rather than a triggered tag, so strict tools under auto are not
+grammar-held there.
+
+The legacy `TF_DSV41_TOOL_GRAMMAR` name takes `0` or `1`. When `TENSORFOLD_TOOL_GRAMMAR` is set, even to an empty
+value, it is read instead and the legacy name is ignored, even if the legacy value is malformed. A malformed legacy
+value without that override logs the accepted form at start and exits with status 1, for example:
+`TF_DSV41_TOOL_GRAMMAR="true": expected 0 or 1 (ignored while TENSORFOLD_TOOL_GRAMMAR is set)`.
+
 `grammar_budget: true` (native server, off by default) keeps a constrained reply completable within its token limit, so
 a required tool call or a JSON value cut by `max_tokens` still parses. Before each draw, a token is masked when no
 continuation after it reaches a place where the grammar could end within the draws left (`max_tokens`, counted after
@@ -1050,13 +1077,22 @@ publishes `server_info{model,backend,version,instance}` (always 1; `instance` is
 so counters restart only with a new `instance`), `process_start_time_seconds`, `engine_parked` (1 while
 `--idle-unload` has closed the engine), `lanes`, and `http_requests_active{route}`: model requests from the end of
 their headers to the end of their reply, by route group (`chat_completions`, `completions`, `responses`,
-`messages`, `embeddings`, `speech`, `other`).
+`messages`, `embeddings`, `speech`, `other`), `request_refusals_total{reason}`: requests refused with a client
+code, one of `engine_busy`, `engine_unavailable` and `memory_pressure` (the [Waits](#waits) codes, counted where
+the chat, embeddings, rerank and speech routes answer with them, and an images engine's busy 503 as `engine_busy`),
+`invalid_request` (the 400 when the engine itself refuses the request it was handed), or an admission flag's 429 by
+its code (`max_inflight_exceeded`, `max_inflight_per_key_exceeded`, `admission_capacity_exceeded`,
+`requests_per_second_exceeded`; see [Admission](#admission)), and `request_failures_total{reason}`: requests that
+ended failed with no refusal code. Its reasons are `backend_prompt`, `backend_round`, `lane_memory_alone` and
+`prompt_too_large` (the engine took the request and it failed), `planner_refused` (a family round planner refused it
+with its own words, as DeepSeek-V4.1 does for a request past its KV pool or its hard memory floor) and
+`engine_stale` (the chat routes' 500 while the device is stale). Every label of both families is always present.
 
 An engine on the shared lane host adds these groups, each complete or absent:
 
 | Group | Families |
 | --- | --- |
-| Requests | `waiting_prompt_tokens` (prompt tokens of queued requests, before any kept prefix restores part of them), `filling_prompt_tokens_left` (absent while a backend without fill progress fills), `requests_started_total`, `requests_requeued_total`, `background_yields_total` |
+| Requests | `requests_waiting_by_reason{reason}` (queued requests by the one wait reason each holds, every reason always present; they sum to `requests_waiting`), `restore_fallbacks_total` (requests whose saved prefix could not be restored, so they prefilled from zero and were served; once a request), `waiting_prompt_tokens` (prompt tokens of queued requests, before any kept prefix restores part of them), `filling_prompt_tokens_left` (absent while a backend without fill progress fills), `requests_started_total`, `requests_requeued_total`, `background_yields_total` |
 | Work | `scheduler_tokens_total{mode}` with `prefill_compute`, `prefill_cache` and `decode` (output tokens after each request's first), counted as the work happens, and `prefill_busy_seconds_total`: engine seconds in prompt calls whose work `prefill_compute` counted. The `prefill_compute` delta over its delta is the prefill rate. A family round planner publishes no work group |
 | Capacity | `kv_capacity_mode{mode}` (`window` or `paged`), `lanes_free`, and for a paged engine `kv_pool_capacity_tokens`, `kv_pool_available_tokens`, `kv_pool_reclaimable_tokens`, `kv_pool_promised_tokens` with `pool="main"`, and `kv_pool_run_available` where the family needs a contiguous run. Published by the CUDA lane host: `window` for an engine without a page plan, `paged` with GLM-5.3-Flash's pool on rank 0; other paged families leave the group out until they name their pool |
 
@@ -1066,9 +1102,23 @@ While the engine is parked, none of these engine values is shown: neither the gr
 unload closes the engine, the engine values are already gone and `engine_parked` is still 0, since a request then
 gets 503 with a retry; it turns 1 once a request can reload the engine.
 
+A queued request holds one wait reason, decided where the engine last tried to admit it and kept until it starts
+or leaves; reading the ledger never asks the engine again. Three reasons are client codes, the same strings as in
+[Waits](#waits): `engine_busy` (no lane is free, or nothing more specific held it yet), `engine_unavailable` (the
+device is stale until a put-back reaches it) and `memory_pressure` (memory pressure holds admission to the streams
+already running). The rest are internal reasons, never a client code: `kv_pool`, `memory_floor` and
+`prefill_concurrent` (a family round planner waits for KV pool pages, for the memory floor, or passes a long prompt
+over while others prefill; DeepSeek-V4.1 names them), `prefix_cut` (it waits for a cut another prompt is filling),
+`state_read` (it waits for its disk state's read ahead), `ledger_bytes` (its caches' bytes do not fit the KV ledger
+now) and `pool_room` (the family's pool has no room for it now). A request behind one that waits for the pool, the
+ledger or the planner holds that request's reason. `memory_floor` is never counted under `memory_pressure`. The
+reasons are as of the engine's last admission attempt: a request queued behind one just admitted keeps its earlier
+reason until the engine next tries to admit it.
+
 `GET /v1/load` returns the same ledger as one JSON object from one read: `instance`, `timestamp` (the read's wall
-time), `model`, `parked`, `lanes`, `http_active` by route group, and, when present, the request counts,
-`capacity` with its `pools`, `tokens` and `busy_us`. Keys of a group no host fills are left out. It follows the
+time), `model`, `parked`, `lanes`, `http_active` by route group, `refusals` by code, and, when present, the request
+counts with `waiting_by_reason` (the same reasons, summing to `waiting`), `capacity` with its `pools`, `tokens` and
+`busy_us`. Keys of a group no host fills are left out. It follows the
 `/metrics` access rule, and `--metrics-open` opens it too.
 
 ## Admission
@@ -1436,6 +1486,68 @@ Connect Claude Code using the ID from `/v1/models`:
 
 ```bash
 ANTHROPIC_BASE_URL=http://127.0.0.1:8080 ANTHROPIC_API_KEY=local claude --model local-model
+```
+
+## Ollama API
+
+The native server also answers Ollama's `/api/*` routes. They translate onto the same chat and embedding seam as
+OpenAI's routes and use the same bearer key; discovery works with a read key, generation needs an inference key.
+Every path below is dispatched in `zig/src/server/routes.zig` and implemented in `zig/src/server/ollama.zig`.
+
+### Discovery: GET `/api/tags`, GET `/api/ps`, GET `/api/version`, GET and POST `/api/show`
+
+These replies are plain JSON, never streamed, and take no request body of consequence. `GET /api/tags` lists every
+configured model as `{"name":ID,"model":ID}` under `models`, without the `modified_at` and `size` fields some
+Ollama clients show. `GET /api/ps` reports one loaded model, the server's served name,
+under `models`. `GET /api/version` returns `{"version":"..."}` from the server's identity. `/api/show` is reachable
+by both methods; the handler reads and drops any request body (a typical `{"model":"..."}` is ignored) and returns
+`{"modelfile":"","parameters":"","template":...,"details":{}}`, where `template` is the engine's chat-template
+source. `/api/tags` lists what `GET /v1/models` lists; the other three have no OpenAI-style counterpart.
+
+```bash
+curl http://127.0.0.1:8080/api/tags
+curl http://127.0.0.1:8080/api/show -d '{"model":"local-model"}'
+curl http://127.0.0.1:8080/api/ps
+curl http://127.0.0.1:8080/api/version
+```
+
+### POST `/api/chat` and POST `/api/generate`
+
+Both bodies go through the same translation: `messages` (an array) or a `prompt` string (wrapped as one user message),
+optional `system` (prepended as a system message), `format` (`"json"` or a JSON-schema object), `tools` plus optional
+`tool_choice`, a boolean `stream`, and `options`. The client's `model` field is ignored: the served name is always
+used. Supported options are `temperature`, `top_k`, `top_p`, `min_p`, `stop`, `seed`, `presence_penalty` and
+`frequency_penalty`, passed through unchanged; `num_predict` becomes `max_tokens`; `num_ctx` is checked against the
+model's context window and then dropped; `think` becomes `chat_template_kwargs.enable_thinking`. Unknown options,
+`images`, `tool_choice` without `tools`, and non-boolean `stream`/`think` are refused with HTTP 400 naming the field.
+The translated request is forced to carry `return_token_ids: true`.
+
+The reply is newline-delimited JSON (`application/x-ndjson`), not SSE: each chunk is one object. `/api/chat` puts
+text in `message: {"role":"assistant","content":...}`; `/api/generate` puts the same text in `response`. Every line
+carries `model` and an RFC 3339 `created_at`. With `stream: false` there is a single line with `done: true` holding
+the whole answer, `done_reason`, `prompt_eval_count`, `eval_count`, `prompt_eval_duration`, `eval_duration` and
+`token_ids`. With `stream: true` there are `done: false` delta lines followed by one final `done: true` line whose
+content is empty; a stream that fails after it opened ends in an `{"error":"..."}` line instead. Errors before the
+200 head go out in OpenAI's `{"error":{...}}` envelope. Compared with `POST /v1/chat/completions`, the model output
+is flattened from `choices[0].message.content` into `message.content` (or `response`), `created_at` replaces
+`created`, token IDs move from `tensorfold.token_ids` to a top-level `token_ids`, and the framing changes from
+SSE/JSON to NDJSON. Both routes occupy the chat-completions admission group and text kind.
+
+```bash
+curl http://127.0.0.1:8080/api/chat -d '{"model":"local-model","messages":[{"role":"user","content":"H"}],"stream":false,"options":{"temperature":0,"num_predict":8,"seed":1234}}'
+curl http://127.0.0.1:8080/api/generate -d '{"model":"local-model","prompt":"H","stream":false}'
+```
+
+### POST `/api/embed`
+
+The body is the OpenAI embeddings body (`input`, `encoding_format`, `dimensions`). The reply is flattened into
+Ollama's shape: `model` plus an `embeddings` array of value arrays, with `prompt_eval_count` from usage when present.
+There is no `object` field, and the per-embedding `object: "embedding"` wrappers of `POST /v1/embeddings` are gone.
+Like `/v1/embeddings`, it is admitted in the embeddings group; unlike it, the reply is a single JSON object, never
+streamed.
+
+```bash
+curl http://127.0.0.1:8080/api/embed -d '{"model":"local-model","input":"hello"}'
 ```
 
 ## Launch a coding agent
