@@ -10,6 +10,7 @@ const Cut = @import("cuda_modelopt_experts.zig").Cut;
 const Heads = @import("cuda_heads.zig").Heads;
 const heads_cut = @import("heads_cut.zig");
 const Entry = safetensors.Entry;
+const environment = @import("sys").environment;
 
 comptime {
     // DeltaNet's out_proj and attention's o_proj take the same input width, so one cut serves both
@@ -22,16 +23,8 @@ const deciders = [_][]const u8{
     "language_model.model.layers.0.mlp.shared_expert.down_proj.weight",
 };
 
-/// TF_FLASHNEXT_SPLIT_DENSE: unset or 1 splits, 0 keeps every dense projection whole.
-pub fn setting(value: ?[]const u8) !bool {
-    const v = value orelse return true;
-    if (std.mem.eql(u8, v, "0")) return false;
-    if (std.mem.eql(u8, v, "1")) return true;
-    return error.BadDenseSplit;
-}
-
 pub fn enabled() !bool {
-    return setting(if (std.c.getenv("TF_FLASHNEXT_SPLIT_DENSE")) |v| std.mem.span(v) else null);
+    return environment.read(bool, "TF_FLASHNEXT_SPLIT_DENSE", true);
 }
 
 /// At two ranks with the setting on, a checkpoint whose deciders are BF16 splits; world 1 never reads the setting.
@@ -111,14 +104,6 @@ const Fake = struct {
     }
 };
 
-test "the dense split setting is on unless 0 and refuses any other value" {
-    try std.testing.expect(try setting(null));
-    try std.testing.expect(try setting("1"));
-    try std.testing.expect(!try setting("0"));
-    try std.testing.expectError(error.BadDenseSplit, setting("2"));
-    try std.testing.expectError(error.BadDenseSplit, setting(""));
-}
-
 test "the dense split applies at two ranks to BF16 layers only, and world 1 never reads the setting" {
     const env = @import("sys").env;
     defer _ = env.unsetenv("TF_FLASHNEXT_SPLIT_DENSE");
@@ -135,7 +120,7 @@ test "the dense split applies at two ranks to BF16 layers only, and world 1 neve
     _ = env.setenv("TF_FLASHNEXT_SPLIT_DENSE", "1", 1);
     try std.testing.expect(try applies(&bf16, 2));
     _ = env.setenv("TF_FLASHNEXT_SPLIT_DENSE", "on", 1);
-    try std.testing.expectError(error.BadDenseSplit, applies(&bf16, 2));
+    try std.testing.expectError(error.InvalidEnvironment, applies(&bf16, 2));
     try std.testing.expect(!try applies(&bf16, 1));
     try std.testing.expect(!try appliesDir(std.testing.allocator, std.testing.io, "/nonexistent", 1));
 }

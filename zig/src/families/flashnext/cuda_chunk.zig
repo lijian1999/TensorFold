@@ -2,17 +2,15 @@
 const std = @import("std");
 const batch = @import("cuda_batch.zig");
 const solo_chunk = @import("lanes").solo_chunk;
+const environment = @import("sys").environment;
 
 /// TF_FLASHNEXT_CHUNK's rows a pass: unset, the default; otherwise 1 to batch.max_chunk, anything else refused.
 pub fn parseChunk(v: ?[]const u8) !usize {
-    const s = v orelse return batch.default_chunk;
-    const n = std.fmt.parseInt(usize, s, 10) catch return error.BadChunk;
-    if (n == 0 or n > batch.max_chunk) return error.BadChunk;
-    return n;
+    return environment.value(usize, "TF_FLASHNEXT_CHUNK", v, batch.default_chunk);
 }
 
 pub fn chunkRows() !usize {
-    return parseChunk(if (std.c.getenv("TF_FLASHNEXT_CHUNK")) |v| std.mem.span(v) else null);
+    return environment.read(usize, "TF_FLASHNEXT_CHUNK", batch.default_chunk);
 }
 
 /// A pass's rows on a server of one stream: no request waits on a pass there, and this takes most of 16,384's gain.
@@ -21,11 +19,12 @@ pub const lone_rows: usize = 8192;
 /// TF_FLASHNEXT_CHUNK_SOLO's rows: unset, `lone_rows` when `lone`, else `busy` (off); below `busy`, refused.
 pub fn parseSolo(v: ?[]const u8, busy: usize, lone: bool) !usize {
     if (v == null and lone) return @max(busy, lone_rows);
-    return solo_chunk.parse(v, .{ .busy = busy, .most = batch.max_chunk }) catch error.BadChunk;
+    const set = try environment.parse("TF_FLASHNEXT_CHUNK_SOLO", v);
+    return solo_chunk.parse(if (set == null) null else v, .{ .busy = busy, .most = batch.max_chunk }) catch error.InvalidEnvironment;
 }
 
 pub fn soloRows(busy: usize, lone: bool) !usize {
-    return parseSolo(if (std.c.getenv("TF_FLASHNEXT_CHUNK_SOLO")) |v| std.mem.span(v) else null, busy, lone);
+    return parseSolo((environment.Process{}).get("TF_FLASHNEXT_CHUNK_SOLO"), busy, lone);
 }
 
 /// The rows the pass of stream `own` takes when it starts: lanes.solo_chunk's rule on the lanes' `filled`.
@@ -44,14 +43,14 @@ test "TF_FLASHNEXT_CHUNK takes 1 to the largest measured pass and refuses the re
     try std.testing.expectEqual(batch.default_chunk, try parseChunk(null));
     try std.testing.expectEqual(@as(usize, 4096), try parseChunk("4096"));
     try std.testing.expectEqual(batch.max_chunk, try parseChunk("16384"));
-    for ([_][]const u8{ "0", "16385", "-1", "4k", "" }) |bad| try std.testing.expectError(error.BadChunk, parseChunk(bad));
+    for ([_][]const u8{ "0", "16385", "-1", "4k", "" }) |bad| try std.testing.expectError(error.InvalidEnvironment, parseChunk(bad));
 }
 
 test "TF_FLASHNEXT_CHUNK_SOLO is off unset, takes the busy chunk to the largest pass and refuses the rest" {
     try std.testing.expectEqual(@as(usize, 1536), try parseSolo(null, 1536, false));
     try std.testing.expectEqual(@as(usize, 8192), try parseSolo("8192", 1536, false));
     try std.testing.expectEqual(@as(usize, 1536), try parseSolo("1536", 1536, false));
-    for ([_][]const u8{ "1024", "0", "16385", "8k", "" }) |bad| try std.testing.expectError(error.BadChunk, parseSolo(bad, 1536, false));
+    for ([_][]const u8{ "1024", "0", "16385", "8k", "" }) |bad| try std.testing.expectError(error.InvalidEnvironment, parseSolo(bad, 1536, false));
 }
 
 test "a server of one stream takes the larger pass unless the variable or a larger busy chunk says otherwise" {

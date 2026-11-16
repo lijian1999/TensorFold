@@ -1,16 +1,14 @@
 //! Optional vocabulary-column partitioning: each rank retains the checkpoint bits for its own output rows.
 const std = @import("std");
 const Tensor = @import("core").safetensors.Tensor;
+const environment = @import("sys").environment;
 
 pub fn setting(value: ?[]const u8) !bool {
-    const v = value orelse return false;
-    if (std.mem.eql(u8, v, "0")) return false;
-    if (std.mem.eql(u8, v, "1")) return true;
-    return error.BadHeadSharding;
+    return environment.value(bool, "TF_FLASHNEXT_SHARD_HEAD", value, false);
 }
 
 pub fn enabled() !bool {
-    return setting(if (std.c.getenv("TF_FLASHNEXT_SHARD_HEAD")) |v| std.mem.span(v) else null);
+    return environment.read(bool, "TF_FLASHNEXT_SHARD_HEAD", false);
 }
 
 pub fn shard(t: Tensor, world: usize, rank: usize) !Tensor {
@@ -44,5 +42,5 @@ test "head partitions preserve every BF16 byte in global vocabulary order" {
     try std.testing.expect(!try setting(null));
     try std.testing.expect(!try setting("0"));
     try std.testing.expect(try setting("1"));
-    try std.testing.expectError(error.BadHeadSharding, setting("2"));
+    try std.testing.expectError(error.InvalidEnvironment, setting("2"));
 }

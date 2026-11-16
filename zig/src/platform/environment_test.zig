@@ -123,6 +123,8 @@ const valid = [_]Case{
     .{ .name = "TF_DSV41_ENGRAM_DIR", .raw = "engram-rows", .n = 0 },
     .{ .name = "TF_DSV41_ENGRAM_VERIFY", .raw = "full", .n = 1 },
     .{ .name = "TF_DSV41_ENGRAM_CACHE", .raw = "0", .n = 0 },
+    .{ .name = "TENSORFOLD_CHECKPOINT_SHA256", .raw = "abababababababababababababababababababababababababababababababab", .n = 0 },
+    .{ .name = "TENSORFOLD_PREFILL_SHARE", .raw = "0.5", .n = @bitCast(@as(f64, 0.5)) },
 };
 
 test "environment: valid forms remain raw numbers before existing consumer clamps and defaults" {

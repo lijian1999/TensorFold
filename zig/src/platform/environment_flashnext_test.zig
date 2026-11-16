@@ -27,23 +27,24 @@ fn check(name: []const u8, raw: []const u8, valid: bool) !void {
         try e.checkScope(.flashnext, fx);
         return t.expect(why == null);
     }
-    try t.expectError(error.InvalidEnvironment, e.checkScope(.flashnext, fx));
+    try t.expectError(error.InvalidEnvironment, e.parse(name, raw));
     try t.expect(std.mem.startsWith(u8, why.?, name));
     try t.expect(std.mem.indexOf(u8, why.?, raw) != null);
     try t.expect(std.mem.endsWith(u8, why.?, e.rule(name).forms));
 }
 
-test "Flash Next strict env: the table holds all 29 settings: 20 switches, 7 integers, 1 real, 1 structured" {
+test "Flash Next strict env: the table holds all 46 settings: 26 switches, 13 integers, 3 reals, 4 structured" {
     var counts: [4]usize = @splat(0);
     for (e.rules) |r| if (r.scope == .flashnext) {
-        try t.expect(std.mem.startsWith(u8, r.name, "TF_FLASHNEXT_"));
+        try t.expect(std.mem.startsWith(u8, r.name, "TF_FLASHNEXT_") or std.mem.startsWith(u8, r.name, "FZ_"));
         counts[@backingInt(group(r))] += 1;
     };
-    try t.expectEqual([4]usize{ 20, 7, 1, 1 }, counts);
+    try t.expectEqual([4]usize{ 26, 13, 3, 4 }, counts);
 }
 
 test "Flash Next strict env: unset and blank settings both read as the caller's default" {
     for (e.rules) |r| if (r.scope == .flashnext) for ([_]?[]const u8{ null, "", " ", "\t", " \t\r\n" }) |raw| {
+        if (raw != null and !r.blank_default) continue;
         if (raw) |v| try check(r.name, v, true);
         switch (group(r)) {
             .switches => for ([_]bool{ false, true }) |d| try t.expectEqual(d, try e.value(bool, r.name, raw, d)),
@@ -64,7 +65,8 @@ test "Flash Next strict env: every switch keeps exactly 0 and 1 and refuses the 
 
 test "Flash Next strict env: every count keeps its whole numbers and refuses junk, negatives, overflow" {
     for (e.rules) |r| if (r.scope == .flashnext and group(r) == .integers) {
-        for ([_][]const u8{ "0", "7", "007" }) |raw| try check(r.name, raw, true);
+        try check(r.name, if (r.min > 0) "1" else "0", true);
+        for ([_][]const u8{ "7", "007" }) |raw| try check(r.name, raw, true);
         try t.expectEqual(@as(u64, 7), try e.value(u64, r.name, "007", 0));
         for ([_][]const u8{ "-1", "1.5", "abc", "18446744073709551616" }) |raw| try check(r.name, raw, false);
     };
@@ -130,4 +132,57 @@ test "Flash Next strict env: the scope refuses only its own settings" {
     defer if (why) |w| t.allocator.free(w);
     try t.expect(why == null);
     try t.expectError(error.InvalidEnvironment, e.checkScope(.flashnext, fx));
+}
+fn checkPath(name: []const u8, raw: []const u8, valid: bool) !void {
+    const fx: Fixture = .{ .name = name, .raw = raw };
+    const why = try e.refusal(t.allocator, fx, .{ .flashnext = true });
+    defer if (why) |w| t.allocator.free(w);
+    if (valid) {
+        try e.checkScope(.flashnext, fx);
+        return t.expect(why == null);
+    }
+    try t.expectError(error.InvalidEnvironment, e.parse(name, raw));
+    try t.expect(std.mem.startsWith(u8, why.?, name));
+    try t.expect(std.mem.endsWith(u8, why.?, e.rule(name).forms));
+}
+
+const Moved = struct { name: []const u8, good: []const u8, bad: []const u8 };
+const moved = [_]Moved{
+    .{ .name = "FZ_BATCH_MTP_CHAIN", .good = "1", .bad = "2" },
+    .{ .name = "FZ_BATCH_MTP_SERIAL", .good = "1", .bad = "2" },
+    .{ .name = "FZ_VERIFY_OVERLAP", .good = "0", .bad = "2" },
+    .{ .name = "FZ_SETTLE_SYNC", .good = "1", .bad = "2" },
+    .{ .name = "TF_FLASHNEXT_PROMPT_EXPERT_TILE", .good = "2", .bad = "3" },
+    .{ .name = "TF_FLASHNEXT_CHUNK", .good = "4096", .bad = "16385" },
+    .{ .name = "TF_FLASHNEXT_CHUNK_SOLO", .good = "8192", .bad = "0" },
+    .{ .name = "TF_FLASHNEXT_SPLIT_DENSE", .good = "0", .bad = "2" },
+    .{ .name = "TF_FLASHNEXT_SHARD_HEAD", .good = "1", .bad = "2" },
+    .{ .name = "TF_FLASHNEXT_LOAD_THREADS", .good = "32", .bad = "33" },
+    .{ .name = "TF_FLASHNEXT_TEMPERATURE", .good = "0.8", .bad = "nan" },
+    .{ .name = "TF_FLASHNEXT_TOP_P", .good = "0.9", .bad = "inf" },
+    .{ .name = "TF_FLASHNEXT_TOP_K", .good = "20", .bad = "-1" },
+    .{ .name = "TF_FLASHNEXT_REPEAT", .good = "2", .bad = "abc" },
+    .{ .name = "TF_FLASHNEXT_SEED", .good = "7", .bad = "x" },
+    .{ .name = "TF_FLASHNEXT_DRAFT_HEAD", .good = "affine4", .bad = "fp8" },
+    .{ .name = "TF_FLASHNEXT_PLE_IO", .good = "pread", .bad = "direct" },
+    .{ .name = "TENSORFOLD_CHECKPOINT_SHA256", .good = "abababababababababababababababababababababababababababababababab", .bad = "ab\nab" },
+    .{ .name = "TENSORFOLD_PREFILL_SHARE", .good = "0.5", .bad = "1.5" },
+};
+
+test "Flash Next migrated settings: unset, one valid value and one malformed value per row" {
+    for (moved) |m| {
+        const unset: Fixture = .{ .name = m.name };
+        try e.checkScope(.flashnext, unset);
+        try t.expect(try e.refusal(t.allocator, unset, .{ .flashnext = true }) == null);
+        switch (e.rule(m.name).kind) {
+            .path => {
+                try checkPath(m.name, m.good, true);
+                try checkPath(m.name, m.bad, false);
+            },
+            else => {
+                try check(m.name, m.good, true);
+                try check(m.name, m.bad, false);
+            },
+        }
+    }
 }
