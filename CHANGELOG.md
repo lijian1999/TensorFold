@@ -4,6 +4,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## Unreleased
 
+- Docs: the GLM-5.3-Flash recipe covers long agent sessions: reasoning the client sends back was about 330K of a 494K-token omp session, the model repeats itself past about 300K, and omp's `replayReasoningContent: false` keeps the prompt to messages and tool results; 1.2.9 and later GLM builds gave byte-identical replies at 458K
+
 - Docs: the GLM-5.3-Flash recipe records the FP8 latent cache's diagnostics on FP4-Local at TP=2 on two GB10s, with its bytes a token and fixed per-stream state, and says it is not qualified (#3432). Thanks to @laudney.
 
 - KV pool: a window's pages go back to the pool once their readers are done, and a step retires under the forward's token, leaving the settle to its caller; no served path calls it yet (#3353, part of #2444). Thanks to @jschmied.
